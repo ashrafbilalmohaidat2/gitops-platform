@@ -205,9 +205,147 @@ Confirmed all five namespaces (`platform`, `apps`, `monitoring`, `security`, `ar
 
 ---
 
-## 🚀 Next Steps (Sprint 3)
+## ✅ Sprint 3: GitOps Layer (ArgoCD)
 
-- Install ArgoCD into the `argocd` namespace.
-- Create a separate GitOps repository containing Kubernetes manifests.
-- Connect ArgoCD to the repository and deploy a first test application.
-- Validate GitOps self-healing behavior (manually delete a pod and observe automatic reconciliation).
+**Goal:** Deploy and manage applications declaratively through Git, using ArgoCD to continuously reconcile the cluster state with a Git repository.
+
+### 1. Installing ArgoCD
+
+Installed ArgoCD into the `argocd` namespace (created earlier via Terraform) using the official manifest:
+
+```bash
+kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+```
+
+**Issue encountered:** One CRD failed to apply:
+```
+The CustomResourceDefinition "applicationsets.argoproj.io" is invalid: metadata.annotations: Too long: may not be more than 262144 bytes
+```
+
+**Cause:** `kubectl apply` stores a `last-applied-configuration` annotation for change tracking, and this particular CRD is large enough to exceed the annotation size limit.
+
+**Fix:** Re-applied using server-side apply, which does not rely on that annotation:
+```bash
+kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml --server-side --force-conflicts
+```
+
+All ArgoCD pods (application-controller, applicationset-controller, dex-server, notifications-controller, redis, repo-server, server) reached `Running` state successfully.
+
+### 2. Accessing the ArgoCD UI
+
+Used port-forwarding to reach the ArgoCD API server locally without exposing it publicly:
+
+```bash
+kubectl port-forward svc/argocd-server -n argocd 8080:443
+```
+
+Retrieved the auto-generated admin password:
+
+```bash
+kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d
+```
+
+Logged into the UI at `https://localhost:8080`.
+
+**Note:** `KUBECONFIG` is only set per-terminal session (via `export`). Running commands in a new terminal without re-exporting it causes `kubectl` to fall back to default (`localhost`) settings, producing misleading TLS/connection errors. Added `export KUBECONFIG=~/.kube/config-k3s` to `~/.bashrc` to persist it across sessions.
+
+### 3. GitOps Repository
+
+Created a separate Git repository (`gitops-manifests/`) to hold the Kubernetes manifests ArgoCD watches and applies — kept independent from the Terraform infrastructure code, though both live in the same project repo.
+
+Initial test workload: a simple `hello-world` Deployment (nginx) + Service, defined declaratively in `gitops-manifests/hello-world/`.
+
+Pushed the repository to GitHub (public, to avoid additional authentication setup at this stage).
+
+### 4. Connecting ArgoCD to the Repository
+
+Created an ArgoCD `Application` resource pointing to the GitOps repo, initially through the UI (New App), with:
+- **Repo URL:** GitHub repo containing `gitops-manifests/hello-world`
+- **Destination namespace:** `apps`
+- **Sync policy:** automated
+
+Result: ArgoCD synced successfully, deploying the `hello-world` Deployment and Service into the `apps` namespace, visible as a resource tree in the UI (`Healthy` / `Synced`).
+
+### 5. Self-Healing: Auto-Sync vs. Self-Heal
+
+Tested GitOps reconciliation with two different scenarios — this revealed an important distinction within ArgoCD's sync policy.
+
+**Test 1 — Deleting a pod manually:**
+```bash
+kubectl delete pod -n apps -l app=hello-world
+```
+The pod was recreated within seconds. **This is standard Kubernetes Deployment Controller behavior** (maintaining the desired replica count) — not specific to ArgoCD. This would happen identically even without GitOps in place.
+
+**Test 2 — Scaling manually via kubectl (the real self-heal test):**
+```bash
+kubectl scale deployment hello-world -n apps --replicas=5
+```
+Result: the Application status changed to `OutOfSync`, but the extra replicas were **not** automatically removed.
+
+**Root cause investigation:**
+```bash
+kubectl get application hello-world -n argocd -o yaml
+```
+revealed the sync policy:
+```yaml
+syncPolicy:
+  automated:
+    enabled: true
+    prune: false
+    selfHeal: false
+```
+
+**Key distinction learned:**
+| Setting | Behavior |
+|---|---|
+| `automated` (enabled) | Applies **new changes pushed to Git** automatically |
+| `selfHeal` | Reverts **manual/out-of-band changes made directly on the cluster** back to what's defined in Git |
+
+These are independent settings — auto-sync alone does not guarantee drift correction.
+
+**Fix:** Enabled `selfHeal`:
+```bash
+kubectl edit application hello-world -n argocd
+```
+```yaml
+syncPolicy:
+  automated:
+    enabled: true
+    prune: false
+    selfHeal: true
+```
+
+**Re-tested:**
+```bash
+kubectl scale deployment hello-world -n apps --replicas=5
+kubectl get pods -n apps -w
+```
+This time, ArgoCD detected the drift and automatically terminated the extra pods, restoring the replica count defined in Git — without any manual `sync` action.
+
+### 6. Declarative Scaling (the correct GitOps way)
+
+To make a scaling change permanent and intentional, the change belongs in Git — not applied ad hoc via `kubectl`:
+
+```yaml
+spec:
+  replicas: 4
+```
+
+```bash
+git add deployment.yaml
+git commit -m "Scale hello-world to 4 replicas via GitOps"
+git push
+```
+
+ArgoCD picked up the change and reconciled the cluster to match — 4 pods running, status `Synced`.
+
+**Key principle reinforced:** `kubectl scale` produces a *temporary* deviation that ArgoCD's self-heal will revert. Editing the manifest and pushing to Git produces a *permanent* desired state that ArgoCD will actively maintain. Git is the single source of truth — any lasting infrastructure decision should be traceable through commit history (who changed what, when, and why).
+
+---
+
+## 🚀 Next Steps (Sprint 4)
+
+- Install `kube-prometheus-stack` (Prometheus + Grafana + Alertmanager) into the `monitoring` namespace.
+- Install Loki + Promtail for log aggregation.
+- Build a custom dashboard covering cluster and application health.
+- Configure a basic alert (e.g. pod CrashLoopBackOff notification).
