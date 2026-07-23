@@ -1,0 +1,10 @@
+# Terraform
+terraform/kubeconfig
+terraform/*.tfstate
+terraform/*.tfstate.backup
+terraform/.terraform/
+terraform/.terraform.lock.hcl
+
+# General
+*.pem
+*.key
